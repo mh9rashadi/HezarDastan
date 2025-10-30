@@ -66,7 +66,7 @@ class TelethonManager:
             logger.error(f"Error creating Telethon client for user {user_id}: {e}")
             return None
 
-        async def send_login_code(self, user_id: int, phone_number: str) -> bool:
+    async def send_login_code(self, user_id: int, phone_number: str) -> bool:
         """
         ارسال کد ورود به شماره کاربر از طریق Telethon (سازگار با نسخه‌های جدید).
         """
