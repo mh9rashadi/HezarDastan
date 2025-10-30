@@ -205,6 +205,18 @@ class TelegramBot:
                 await message.answer("🔒 احراز هویت دو مرحله‌ای (2FA) فعال است. لطفاً گذرواژه 2FA حساب تلگرام خود را ارسال کنید.")
                 await state.set_state(UserStates.waiting_for_password)
                 return
+            if result.get('error') == 'code_expired':
+                # try auto resend latest code (fallback to SMS if needed)
+                await message.answer("⌛ کد منقضی شد؛ در حال ارسال کد جدید هستم...")
+                # تلاش برای ارسال دوباره کد
+                data = await state.get_data()
+                phone = data.get("phone_number")
+                if phone:
+                    await self.telethon_manager.send_login_code(user_id, phone)
+                    await message.answer("📩 کد جدید ارسال شد. لطفاً آخرین کد را وارد کنید.")
+                else:
+                    await message.answer("لطفاً دوباره /connect را بزنید.")
+                return
             if result.get('ok'):
                 await message.answer(
                     "✅ کد تأیید صحیح است!\n"

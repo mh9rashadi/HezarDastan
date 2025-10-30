@@ -20,6 +20,7 @@ class TelethonManager:
         self.db = DatabaseManager()
         self.clients: Dict[int, TelegramClient] = {}
         self.pending_phones: Dict[int, str] = {}
+        self.pending_code_hash: Dict[int, str] = {}
         
         # ایجاد دایرکتوری sessions
         os.makedirs(session_dir, exist_ok=True)
@@ -72,7 +73,13 @@ class TelethonManager:
             if client is None:
                 return False
             self.pending_phones[user_id] = phone_number
-            await client.send_code_request(phone_number)
+            code = await client.send_code_request(phone_number)
+            # keep phone_code_hash explicitly to survive multi-worker scenarios
+            try:
+                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None) or code.phone_code_hash
+            except Exception:
+                # some Telethon versions return dict-like
+                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None)
             logger.info("Login code sent to %s for user %s", phone_number, user_id)
             return True
         except PhoneNumberInvalidError:
@@ -102,7 +109,8 @@ class TelethonManager:
 
             try:
                 if code is not None:
-                    await client.sign_in(phone=phone, code=code)
+                    pch = self.pending_code_hash.get(user_id)
+                    await client.sign_in(phone=phone, code=code, phone_code_hash=pch)
                 elif password is not None:
                     # If only password provided (after SessionPasswordNeeded), try password sign-in
                     await client.sign_in(password=password)
@@ -122,11 +130,16 @@ class TelethonManager:
             logger.info("User %s authorized successfully", user_id)
             # Cleanup pending phone
             self.pending_phones.pop(user_id, None)
+            self.pending_code_hash.pop(user_id, None)
             return { 'ok': True, 'need_password': False, 'error': None }
         except PhoneCodeInvalidError:
             logger.error("Invalid login code for user %s", user_id)
             return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
         except Exception as e:
+            msg = str(e)
+            if 'expired' in msg.lower():
+                # Hint caller to resend
+                return { 'ok': False, 'need_password': False, 'error': 'code_expired' }
             logger.error(f"Error confirming login code for user {user_id}: {e}")
             return { 'ok': False, 'need_password': False, 'error': str(e) }
     
