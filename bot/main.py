@@ -12,6 +12,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database.db import DatabaseManager
+from telethon_client.manager import TelethonManager
 
 # تنظیمات لاگینگ
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 class UserStates(StatesGroup):
     waiting_for_phone = State()
     waiting_for_code = State()
+    waiting_for_password = State()
     waiting_for_confirmation = State()
 
 class TelegramBot:
@@ -30,6 +32,8 @@ class TelegramBot:
         self.db = DatabaseManager()
         self.api_id = api_id
         self.api_hash = api_hash
+        # Telethon manager
+        self.telethon_manager = TelethonManager(api_id, api_hash)
         
         # ثبت handlerها
         self.register_handlers()
@@ -42,6 +46,7 @@ class TelegramBot:
         self.dp.message.register(self.help_command, Command("help"))
         self.dp.message.register(self.handle_phone_number, UserStates.waiting_for_phone)
         self.dp.message.register(self.handle_verification_code, UserStates.waiting_for_code)
+        self.dp.message.register(self.handle_2fa_password, UserStates.waiting_for_password)
         self.dp.message.register(self.handle_confirmation, UserStates.waiting_for_confirmation)
         self.dp.callback_query.register(self.handle_callback_query)
     
@@ -148,58 +153,64 @@ class TelegramBot:
                 reply_markup=types.ReplyKeyboardRemove()
             )
             
-            # شروع فرآیند اتصال Telethon
-            await self.start_telethon_connection(user_id, phone_number)
+            # ذخیره شماره در حافظه حالت
+            await state.update_data(phone_number=phone_number)
             
-            # تغییر حالت به انتظار کد تأیید
-            await state.set_state(UserStates.waiting_for_code)
+            # ارسال کد ورود از طریق Telethon
+            ok = await self.start_telethon_connection(user_id, phone_number)
+            if ok:
+                # تغییر حالت به انتظار کد تأیید
+                await state.set_state(UserStates.waiting_for_code)
+            else:
+                await message.answer("❌ ارسال کد ورود با خطا مواجه شد. کمی بعد دوباره تلاش کنید.")
             
         else:
             await message.answer(
                 "❌ لطفاً شماره تلفن خود را از طریق دکمه 'ارسال شماره تلفن' ارسال کنید."
             )
     
-    async def start_telethon_connection(self, user_id: int, phone_number: str):
-        """شروع اتصال Telethon"""
+    async def start_telethon_connection(self, user_id: int, phone_number: str) -> bool:
+        """شروع ارسال کد ورود با Telethon"""
         try:
-            # اینجا باید Telethon client را راه‌اندازی کنیم
-            # فعلاً فقط پیام نمایش می‌دهیم
-            logger.info(f"Starting Telethon connection for user {user_id} with phone {phone_number}")
-            
-            # TODO: پیاده‌سازی اتصال واقعی Telethon
-            # از ماژول telethon_client استفاده خواهیم کرد
-            
+            logger.info(f"Starting Telethon code request for user {user_id} with phone {phone_number}")
+            if not self.telethon_manager:
+                logger.error("Telethon manager is not initialized")
+                return False
+            sent = await self.telethon_manager.send_login_code(user_id, phone_number)
+            return sent
         except Exception as e:
             logger.error(f"Error starting Telethon connection: {e}")
+            return False
     
     async def handle_verification_code(self, message: types.Message, state: FSMContext):
         """پردازش کد تأیید"""
         code = message.text.strip()
         user_id = message.from_user.id
         
-        if not code.isdigit() or len(code) != 5:
-            await message.answer("❌ کد تأیید باید ۵ رقم باشد. لطفاً دوباره وارد کنید:")
+        if not code.isdigit() or len(code) not in (5, 6):
+            await message.answer("❌ کد تأیید باید ۵ یا ۶ رقم باشد. لطفاً دوباره وارد کنید:")
             return
         
         try:
-            # اینجا باید کد را به Telethon ارسال کنیم
             logger.info(f"Verification code received for user {user_id}: {code}")
-            
-            # TODO: ارسال کد به Telethon و بررسی صحت آن
-            
-            # فعلاً فرض می‌کنیم کد صحیح است
-            await message.answer(
-                "✅ کد تأیید صحیح است!\n"
-                "🔗 اتصال به حساب تلگرام شما با موفقیت برقرار شد.\n\n"
-                "📱 حالا من پیام‌های شما را مانیتور می‌کنم و هر زمان که کلماتی مثل "
-                "'جلسه'، 'قرار' یا 'meeting' ببینم، به شما اطلاع می‌دهم."
-            )
-            
-            # به‌روزرسانی وضعیت در دیتابیس
-            self.db.update_telethon_status(user_id, True, f"user_{user_id}.session")
-            
-            # خروج از حالت
-            await state.clear()
+            data = await state.get_data()
+            phone = data.get("phone_number")
+            if not phone:
+                await message.answer("❌ شماره تلفن پیدا نشد. لطفاً دوباره /connect را بزنید.")
+                await state.clear()
+                return
+
+            ok = await self.telethon_manager.confirm_login_code(user_id, code)
+            if ok:
+                await message.answer(
+                    "✅ کد تأیید صحیح است!\n"
+                    "🔗 اتصال به حساب تلگرام شما با موفقیت برقرار شد.\n\n"
+                    "📱 حالا من پیام‌های شما را مانیتور می‌کنم و هر زمان کلماتی مثل 'جلسه'، 'قرار' یا 'meeting' ببینم، به شما اطلاع می‌دهم."
+                )
+                await state.clear()
+            else:
+                await message.answer("❌ کد نامعتبر است یا نیاز به گذرواژه 2FA دارد. اگر 2FA فعال است، گذرواژه خود را ارسال کنید:")
+                await state.set_state(UserStates.waiting_for_password)
             
         except Exception as e:
             logger.error(f"Error verifying code: {e}")
@@ -219,6 +230,21 @@ class TelegramBot:
             await message.answer("لطفاً 'بله' یا 'خیر' پاسخ دهید.")
         
         await state.clear()
+
+    async def handle_2fa_password(self, message: types.Message, state: FSMContext):
+        """دریافت گذرواژه 2FA و تکمیل ورود"""
+        try:
+            user_id = message.from_user.id
+            password = message.text.strip()
+            ok = await self.telethon_manager.confirm_login_code(user_id, code="00000", password=password)  # code ignored when password used
+            if ok:
+                await message.answer("✅ ورود با گذرواژه 2FA انجام شد و اتصال برقرار است.")
+                await state.clear()
+            else:
+                await message.answer("❌ گذرواژه 2FA نادرست بود. دوباره تلاش کنید یا /connect را بزنید.")
+        except Exception as e:
+            logger.error(f"Error handling 2FA password: {e}")
+            await message.answer("❌ خطا در تایید گذرواژه 2FA.")
     
     async def handle_callback_query(self, callback_query: types.CallbackQuery, state: FSMContext):
         """پردازش callback queryها"""

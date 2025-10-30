@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError, PhoneNumberInvalidError
 from telethon.tl.types import User, Chat, Channel
 import os
 import re
@@ -19,6 +19,7 @@ class TelethonManager:
         self.session_dir = session_dir
         self.db = DatabaseManager()
         self.clients: Dict[int, TelegramClient] = {}
+        self.pending_phones: Dict[int, str] = {}
         
         # ایجاد دایرکتوری sessions
         os.makedirs(session_dir, exist_ok=True)
@@ -45,7 +46,10 @@ class TelethonManager:
             session_path = os.path.join(self.session_dir, f"user_{user_id}.session")
             
             client = TelegramClient(session_path, self.api_id, self.api_hash)
-            await client.start(phone=phone_number)
+            # start() would try to drive interactive login; we attach after explicit sign in
+            await client.connect()
+            if not await client.is_user_authorized():
+                logger.debug("Client created but not authorized yet for user %s", user_id)
             
             self.clients[user_id] = client
             
@@ -60,6 +64,64 @@ class TelethonManager:
         except Exception as e:
             logger.error(f"Error creating Telethon client for user {user_id}: {e}")
             return None
+
+    async def send_login_code(self, user_id: int, phone_number: str) -> bool:
+        """ارسال کد ورود به شماره کاربر از طریق Telethon."""
+        try:
+            client = await self.create_client(user_id, phone_number)
+            if client is None:
+                return False
+            self.pending_phones[user_id] = phone_number
+            await client.send_code_request(phone_number)
+            logger.info("Login code sent to %s for user %s", phone_number, user_id)
+            return True
+        except PhoneNumberInvalidError:
+            logger.error("Invalid phone number for user %s: %s", user_id, phone_number)
+            return False
+        except FloodWaitError as e:
+            logger.error("Flood wait while sending code for user %s: %s", user_id, e)
+            return False
+        except Exception as e:
+            logger.error(f"Error sending login code for user {user_id}: {e}")
+            return False
+
+    async def confirm_login_code(self, user_id: int, code: str, password: str | None = None) -> bool:
+        """تأیید کد ورود و تکمیل ورود. در صورت فعال بودن 2FA، پارامتر password استفاده می‌شود."""
+        try:
+            if user_id not in self.clients:
+                logger.error("Client not initialized for user %s", user_id)
+                return False
+            client = self.clients[user_id]
+            phone = self.pending_phones.get(user_id)
+            if not phone:
+                logger.error("No pending phone number for user %s", user_id)
+                return False
+
+            try:
+                await client.sign_in(phone=phone, code=code)
+            except SessionPasswordNeededError:
+                if not password:
+                    # Password needed; caller should ask for it
+                    logger.info("2FA password required for user %s", user_id)
+                    return False
+                await client.sign_in(password=password)
+
+            # Mark connected and add handlers
+            @client.on(events.NewMessage(incoming=True))
+            async def handle_new_message(event):
+                await self.handle_message(event, user_id)
+
+            self.db.update_telethon_status(user_id, True, os.path.join(self.session_dir, f"user_{user_id}.session"))
+            logger.info("User %s authorized successfully", user_id)
+            # Cleanup pending phone
+            self.pending_phones.pop(user_id, None)
+            return True
+        except PhoneCodeInvalidError:
+            logger.error("Invalid login code for user %s", user_id)
+            return False
+        except Exception as e:
+            logger.error(f"Error confirming login code for user {user_id}: {e}")
+            return False
     
     async def handle_message(self, event, user_id: int):
         """پردازش پیام‌های دریافتی"""
