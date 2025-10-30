@@ -66,31 +66,41 @@ class TelethonManager:
             logger.error(f"Error creating Telethon client for user {user_id}: {e}")
             return None
 
-    async def send_login_code(self, user_id: int, phone_number: str, *, force_sms: bool = False) -> bool:
-        """ارسال کد ورود به شماره کاربر از طریق Telethon."""
+        async def send_login_code(self, user_id: int, phone_number: str) -> bool:
+        """
+        ارسال کد ورود به شماره کاربر از طریق Telethon (سازگار با نسخه‌های جدید).
+        """
         try:
+            # ایجاد کلاینت مخصوص این کاربر
             client = await self.create_client(user_id, phone_number)
             if client is None:
+                logger.error(f"❌ Client creation failed for user {user_id}")
                 return False
+
+            # ذخیره شماره موقت برای کاربر
             self.pending_phones[user_id] = phone_number
-            code = await client.send_code_request(phone_number, force_sms=force_sms)
-            # keep phone_code_hash explicitly to survive multi-worker scenarios
-            try:
-                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None) or code.phone_code_hash
-            except Exception:
-                # some Telethon versions return dict-like
-                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None)
-            logger.info("Login code sent to %s for user %s", phone_number, user_id)
+
+            # درخواست ارسال کد به کاربر (Telethon خودش تصمیم می‌گیره کد از طریق تلگرام یا SMS بیاد)
+            result = await client.send_code_request(phone_number)
+
+            # ذخیره phone_code_hash برای استفاده بعدی در sign_in
+            self.pending_code_hash[user_id] = getattr(result, 'phone_code_hash', None)
+
+            logger.info(f"✅ Login code requested for user {user_id} ({phone_number})")
             return True
+
         except PhoneNumberInvalidError:
-            logger.error("Invalid phone number for user %s: %s", user_id, phone_number)
+            logger.error(f"❌ Invalid phone number for user {user_id}: {phone_number}")
             return False
+
         except FloodWaitError as e:
-            logger.error("Flood wait while sending code for user %s: %s", user_id, e)
+            logger.warning(f"⏳ Flood wait ({e.seconds}s) while sending code for user {user_id}")
             return False
+
         except Exception as e:
-            logger.error(f"Error sending login code for user {user_id}: {e}")
+            logger.error(f"🔥 Unexpected error while sending login code for user {user_id}: {e}")
             return False
+
 
     async def confirm_login_code(self, user_id: int, code: str | None = None, password: str | None = None) -> Dict[str, Any]:
         """تأیید کد ورود و تکمیل ورود.
