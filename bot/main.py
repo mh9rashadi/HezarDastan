@@ -148,19 +148,23 @@ class TelegramBot:
             
             await message.answer(
                 f"✅ شماره تلفن شما ({phone_number}) دریافت شد!\n\n"
-                "🔐 حالا در حال اتصال به حساب تلگرام شما هستم...\n"
-                "لطفاً کد تأیید که به تلگرام شما ارسال می‌شود را وارد کنید:",
+                "🔐 حالا در حال اتصال به حساب تلگرام شما هستم...\n",
                 reply_markup=types.ReplyKeyboardRemove()
             )
             
             # ذخیره شماره در حافظه حالت
-            await state.update_data(phone_number=phone_number)
+            await state.update_data(phone_number=phone_number, resend_count=0)
             
             # ارسال کد ورود از طریق Telethon
             ok = await self.start_telethon_connection(user_id, phone_number)
             if ok:
+                # دکمه ارسال مجدد کد
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="ارسال مجدد کد", callback_data="resend_code")]
+                ])
                 # تغییر حالت به انتظار کد تأیید
                 await state.set_state(UserStates.waiting_for_code)
+                await message.answer("لطفاً کد تأیید که به تلگرام شما ارسال می‌شود را وارد کنید:", reply_markup=kb)
             else:
                 await message.answer("❌ ارسال کد ورود با خطا مواجه شد. کمی بعد دوباره تلاش کنید.")
             
@@ -206,16 +210,7 @@ class TelegramBot:
                 await state.set_state(UserStates.waiting_for_password)
                 return
             if result.get('error') == 'code_expired':
-                # try auto resend latest code (fallback to SMS if needed)
-                await message.answer("⌛ کد منقضی شد؛ در حال ارسال کد جدید هستم...")
-                # تلاش برای ارسال دوباره کد
-                data = await state.get_data()
-                phone = data.get("phone_number")
-                if phone:
-                    await self.telethon_manager.send_login_code(user_id, phone)
-                    await message.answer("📩 کد جدید ارسال شد. لطفاً آخرین کد را وارد کنید.")
-                else:
-                    await message.answer("لطفاً دوباره /connect را بزنید.")
+                await message.answer("⌛ کد منقضی شد. برای دریافت کد جدید، روی دکمه ‘ارسال مجدد کد’ بزنید.")
                 return
             if result.get('ok'):
                 await message.answer(
@@ -268,6 +263,20 @@ class TelegramBot:
         
         if data == "connect_telegram":
             await self.start_telegram_connection(callback_query.message, state)
+        elif data == "resend_code":
+            data_state = await state.get_data()
+            phone = data_state.get("phone_number")
+            resend_count = int(data_state.get("resend_count", 0))
+            if not phone:
+                await callback_query.message.answer("لطفاً دوباره /connect را بزنید.")
+            else:
+                force_sms = resend_count >= 1
+                ok = await self.telethon_manager.send_login_code(user_id, phone, force_sms=force_sms)
+                if ok:
+                    await state.update_data(resend_count=resend_count + 1)
+                    await callback_query.message.answer("📩 کد جدید ارسال شد. لطفاً آخرین کد را وارد کنید.")
+                else:
+                    await callback_query.message.answer("❌ ارسال مجدد کد ناموفق بود. چند دقیقه بعد دوباره تلاش کنید.")
         
         await callback_query.answer()
     

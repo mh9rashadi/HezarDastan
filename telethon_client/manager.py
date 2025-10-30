@@ -66,14 +66,14 @@ class TelethonManager:
             logger.error(f"Error creating Telethon client for user {user_id}: {e}")
             return None
 
-    async def send_login_code(self, user_id: int, phone_number: str) -> bool:
+    async def send_login_code(self, user_id: int, phone_number: str, *, force_sms: bool = False) -> bool:
         """ارسال کد ورود به شماره کاربر از طریق Telethon."""
         try:
             client = await self.create_client(user_id, phone_number)
             if client is None:
                 return False
             self.pending_phones[user_id] = phone_number
-            code = await client.send_code_request(phone_number)
+            code = await client.send_code_request(phone_number, force_sms=force_sms)
             # keep phone_code_hash explicitly to survive multi-worker scenarios
             try:
                 self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None) or code.phone_code_hash
