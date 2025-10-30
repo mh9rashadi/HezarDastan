@@ -85,26 +85,33 @@ class TelethonManager:
             logger.error(f"Error sending login code for user {user_id}: {e}")
             return False
 
-    async def confirm_login_code(self, user_id: int, code: str, password: str | None = None) -> bool:
-        """تأیید کد ورود و تکمیل ورود. در صورت فعال بودن 2FA، پارامتر password استفاده می‌شود."""
+    async def confirm_login_code(self, user_id: int, code: str | None = None, password: str | None = None) -> Dict[str, Any]:
+        """تأیید کد ورود و تکمیل ورود.
+        خروجی:
+        { 'ok': bool, 'need_password': bool, 'error': Optional[str] }
+        """
         try:
             if user_id not in self.clients:
                 logger.error("Client not initialized for user %s", user_id)
-                return False
+                return { 'ok': False, 'need_password': False, 'error': 'client_not_initialized' }
             client = self.clients[user_id]
             phone = self.pending_phones.get(user_id)
             if not phone:
                 logger.error("No pending phone number for user %s", user_id)
-                return False
+                return { 'ok': False, 'need_password': False, 'error': 'no_pending_phone' }
 
             try:
-                await client.sign_in(phone=phone, code=code)
+                if code is not None:
+                    await client.sign_in(phone=phone, code=code)
+                elif password is not None:
+                    # If only password provided (after SessionPasswordNeeded), try password sign-in
+                    await client.sign_in(password=password)
+                else:
+                    return { 'ok': False, 'need_password': False, 'error': 'missing_code_or_password' }
             except SessionPasswordNeededError:
-                if not password:
-                    # Password needed; caller should ask for it
-                    logger.info("2FA password required for user %s", user_id)
-                    return False
-                await client.sign_in(password=password)
+                # Password needed; caller should ask for it
+                logger.info("2FA password required for user %s", user_id)
+                return { 'ok': False, 'need_password': True, 'error': None }
 
             # Mark connected and add handlers
             @client.on(events.NewMessage(incoming=True))
@@ -115,13 +122,13 @@ class TelethonManager:
             logger.info("User %s authorized successfully", user_id)
             # Cleanup pending phone
             self.pending_phones.pop(user_id, None)
-            return True
+            return { 'ok': True, 'need_password': False, 'error': None }
         except PhoneCodeInvalidError:
             logger.error("Invalid login code for user %s", user_id)
-            return False
+            return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
         except Exception as e:
             logger.error(f"Error confirming login code for user {user_id}: {e}")
-            return False
+            return { 'ok': False, 'need_password': False, 'error': str(e) }
     
     async def handle_message(self, event, user_id: int):
         """پردازش پیام‌های دریافتی"""

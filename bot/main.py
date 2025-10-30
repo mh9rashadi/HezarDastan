@@ -200,8 +200,12 @@ class TelegramBot:
                 await state.clear()
                 return
 
-            ok = await self.telethon_manager.confirm_login_code(user_id, code)
-            if ok:
+            result = await self.telethon_manager.confirm_login_code(user_id, code)
+            if result.get('need_password'):
+                await message.answer("🔒 احراز هویت دو مرحله‌ای (2FA) فعال است. لطفاً گذرواژه 2FA حساب تلگرام خود را ارسال کنید.")
+                await state.set_state(UserStates.waiting_for_password)
+                return
+            if result.get('ok'):
                 await message.answer(
                     "✅ کد تأیید صحیح است!\n"
                     "🔗 اتصال به حساب تلگرام شما با موفقیت برقرار شد.\n\n"
@@ -209,8 +213,7 @@ class TelegramBot:
                 )
                 await state.clear()
             else:
-                await message.answer("❌ کد نامعتبر است یا نیاز به گذرواژه 2FA دارد. اگر 2FA فعال است، گذرواژه خود را ارسال کنید:")
-                await state.set_state(UserStates.waiting_for_password)
+                await message.answer("❌ کد نامعتبر است. لطفاً دوباره تلاش کنید یا /connect را بزنید.")
             
         except Exception as e:
             logger.error(f"Error verifying code: {e}")
@@ -236,8 +239,8 @@ class TelegramBot:
         try:
             user_id = message.from_user.id
             password = message.text.strip()
-            ok = await self.telethon_manager.confirm_login_code(user_id, code="00000", password=password)  # code ignored when password used
-            if ok:
+            result = await self.telethon_manager.confirm_login_code(user_id, code=None, password=password)
+            if result.get('ok'):
                 await message.answer("✅ ورود با گذرواژه 2FA انجام شد و اتصال برقرار است.")
                 await state.clear()
             else:
