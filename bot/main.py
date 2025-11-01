@@ -204,14 +204,29 @@ class TelegramBot:
                 await state.clear()
                 return
 
+            logger.info(f"Calling confirm_login_code for user {user_id} with code {code}")
             result = await self.telethon_manager.confirm_login_code(user_id, code)
+            logger.info(f"Result from confirm_login_code for user {user_id}: {result}")
+            
             if result.get('need_password'):
                 await message.answer("🔒 احراز هویت دو مرحله‌ای (2FA) فعال است. لطفاً گذرواژه 2FA حساب تلگرام خود را ارسال کنید.")
                 await state.set_state(UserStates.waiting_for_password)
                 return
-            if result.get('error') == 'code_expired':
-                await message.answer("⌛ کد منقضی شد. برای دریافت کد جدید، روی دکمه ‘ارسال مجدد کد’ بزنید.")
+            
+            error = result.get('error')
+            if error == 'code_expired':
+                logger.warning(f"Code expired for user {user_id}")
+                await message.answer("⌛ کد منقضی شد. برای دریافت کد جدید، روی دکمه 'ارسال مجدد کد' بزنید.")
                 return
+            elif error == 'code_hash_missing':
+                logger.warning(f"Code hash missing for user {user_id}, need to resend code")
+                await message.answer("⌛ کد منقضی شده. لطفاً روی دکمه 'ارسال مجدد کد' بزنید.")
+                return
+            elif error:
+                logger.error(f"Error in confirm_login_code for user {user_id}: {error}")
+                await message.answer(f"❌ خطا در تأیید کد: {error}. لطفاً دوباره /connect را بزنید.")
+                return
+            
             if result.get('ok'):
                 await message.answer(
                     "✅ کد تأیید صحیح است!\n"
@@ -220,6 +235,7 @@ class TelegramBot:
                 )
                 await state.clear()
             else:
+                logger.warning(f"Unknown result for user {user_id}: {result}")
                 await message.answer("❌ کد نامعتبر است. لطفاً دوباره تلاش کنید یا /connect را بزنید.")
             
         except Exception as e:

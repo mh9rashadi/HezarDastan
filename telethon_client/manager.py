@@ -69,18 +69,34 @@ class TelethonManager:
     async def send_login_code(self, user_id: int, phone_number: str, *, force_sms: bool = False) -> bool:
         """ارسال کد ورود به شماره کاربر از طریق Telethon."""
         try:
-            client = await self.create_client(user_id, phone_number)
-            if client is None:
-                return False
+            # اگر کلاینت وجود داره، از همون استفاده کن (مهم!)
+            if user_id not in self.clients:
+                client = await self.create_client(user_id, phone_number)
+                if client is None:
+                    return False
+            else:
+                client = self.clients[user_id]
+                logger.info(f"Reusing existing client for user {user_id}")
+            
             self.pending_phones[user_id] = phone_number
-            code = await client.send_code_request(phone_number, force_sms=force_sms)
-            # keep phone_code_hash explicitly to survive multi-worker scenarios
-            try:
-                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None) or code.phone_code_hash
-            except Exception:
-                # some Telethon versions return dict-like
-                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None)
-            logger.info("Login code sent to %s for user %s", phone_number, user_id)
+            
+            # ارسال کد و دریافت phone_code_hash
+            code_result = await client.send_code_request(phone_number, force_sms=force_sms)
+            
+            # استخراج phone_code_hash از نتیجه
+            phone_code_hash = None
+            if hasattr(code_result, 'phone_code_hash'):
+                phone_code_hash = code_result.phone_code_hash
+            elif isinstance(code_result, dict) and 'phone_code_hash' in code_result:
+                phone_code_hash = code_result['phone_code_hash']
+            
+            if phone_code_hash:
+                self.pending_code_hash[user_id] = phone_code_hash
+                logger.info("Login code sent to %s for user %s (hash: %s)", phone_number, user_id, phone_code_hash[:10] if phone_code_hash else "None")
+            else:
+                logger.error("Failed to extract phone_code_hash from send_code_request result")
+                return False
+            
             return True
         except PhoneNumberInvalidError:
             logger.error("Invalid phone number for user %s: %s", user_id, phone_number)
@@ -98,21 +114,50 @@ class TelethonManager:
         { 'ok': bool, 'need_password': bool, 'error': Optional[str] }
         """
         try:
+            # اگر کلاینت وجود نداره، از session فایل دوباره بساز
             if user_id not in self.clients:
-                logger.error("Client not initialized for user %s", user_id)
-                return { 'ok': False, 'need_password': False, 'error': 'client_not_initialized' }
+                logger.warning(f"Client not in memory for user {user_id}, recreating from session...")
+                phone = self.pending_phones.get(user_id)
+                if phone:
+                    client = await self.create_client(user_id, phone)
+                    if client is None:
+                        logger.error("Client not initialized for user %s", user_id)
+                        return { 'ok': False, 'need_password': False, 'error': 'client_not_initialized' }
+                else:
+                    logger.error("Client not initialized for user %s", user_id)
+                    return { 'ok': False, 'need_password': False, 'error': 'client_not_initialized' }
+            
             client = self.clients[user_id]
             phone = self.pending_phones.get(user_id)
             if not phone:
                 logger.error("No pending phone number for user %s", user_id)
                 return { 'ok': False, 'need_password': False, 'error': 'no_pending_phone' }
 
+            # گرفتن phone_code_hash
+            pch = self.pending_code_hash.get(user_id)
+            if not pch:
+                logger.warning(f"phone_code_hash not found in memory for user {user_id}, trying to read from session...")
+                # تلاش برای خواندن از session (اگر Telethon ذخیره کرده باشه)
+                try:
+                    session_path = os.path.join(self.session_dir, f"user_{user_id}.session")
+                    # Telethon ممکنه phone_code_hash رو در session ذخیره کنه
+                    # اما این کار ساده‌ای نیست، پس بهتره دوباره کد بفرستیم
+                    logger.error("phone_code_hash not available, code may have expired")
+                    return { 'ok': False, 'need_password': False, 'error': 'code_hash_missing' }
+                except Exception:
+                    pass
+
             try:
                 if code is not None:
-                    pch = self.pending_code_hash.get(user_id)
-                    await client.sign_in(phone=phone, code=code, phone_code_hash=pch)
+                    logger.info(f"Attempting to sign in user {user_id} with code (hash available: {pch is not None})")
+                    if pch:
+                        await client.sign_in(phone=phone, code=code, phone_code_hash=pch)
+                    else:
+                        # اگر hash نداریم، بدون hash امتحان کنیم (ممکنه Telethon از session بخونه)
+                        await client.sign_in(phone=phone, code=code)
                 elif password is not None:
                     # If only password provided (after SessionPasswordNeeded), try password sign-in
+                    logger.info(f"Attempting to sign in user {user_id} with password")
                     await client.sign_in(password=password)
                 else:
                     return { 'ok': False, 'need_password': False, 'error': 'missing_code_or_password' }
@@ -120,6 +165,22 @@ class TelethonManager:
                 # Password needed; caller should ask for it
                 logger.info("2FA password required for user %s", user_id)
                 return { 'ok': False, 'need_password': True, 'error': None }
+            except PhoneCodeInvalidError as e:
+                logger.error(f"Invalid login code for user {user_id}: {e}")
+                return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
+            except Exception as sign_in_error:
+                # بررسی خطاهای مختلف
+                error_msg = str(sign_in_error).lower()
+                logger.error(f"Sign in error for user {user_id}: {sign_in_error}")
+                
+                if 'expired' in error_msg or 'code has expired' in error_msg:
+                    logger.error("Code expired for user %s", user_id)
+                    return { 'ok': False, 'need_password': False, 'error': 'code_expired' }
+                elif 'code' in error_msg and ('invalid' in error_msg or 'wrong' in error_msg):
+                    return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
+                else:
+                    # دوباره raise کن تا در except بعدی هندل بشه
+                    raise
 
             # Mark connected and add handlers
             @client.on(events.NewMessage(incoming=True))
@@ -132,15 +193,18 @@ class TelethonManager:
             self.pending_phones.pop(user_id, None)
             self.pending_code_hash.pop(user_id, None)
             return { 'ok': True, 'need_password': False, 'error': None }
-        except PhoneCodeInvalidError:
-            logger.error("Invalid login code for user %s", user_id)
+        except PhoneCodeInvalidError as e:
+            logger.error(f"Invalid login code for user {user_id}: {e}")
             return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
         except Exception as e:
-            msg = str(e)
-            if 'expired' in msg.lower():
-                # Hint caller to resend
+            msg = str(e).lower()
+            logger.error(f"Error confirming login code for user {user_id}: {type(e).__name__}: {e}")
+            
+            if 'expired' in msg or 'code has expired' in msg:
                 return { 'ok': False, 'need_password': False, 'error': 'code_expired' }
-            logger.error(f"Error confirming login code for user {user_id}: {e}")
+            elif 'code' in msg and ('invalid' in msg or 'wrong' in msg):
+                return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
+            
             return { 'ok': False, 'need_password': False, 'error': str(e) }
     
     async def handle_message(self, event, user_id: int):
