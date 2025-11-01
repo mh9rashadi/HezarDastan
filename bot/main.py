@@ -261,24 +261,45 @@ class TelegramBot:
         data = callback_query.data
         user_id = callback_query.from_user.id
         
+        # جلوگیری از double-click
+        await callback_query.answer()
+        
         if data == "connect_telegram":
             await self.start_telegram_connection(callback_query.message, state)
         elif data == "resend_code":
+            # بررسی اینکه آیا در حال پردازش هستیم
             data_state = await state.get_data()
+            if data_state.get("resending_code"):
+                await callback_query.message.answer("⏳ در حال ارسال کد جدید هستم، لطفاً منتظر بمانید...")
+                return
+            
             phone = data_state.get("phone_number")
             resend_count = int(data_state.get("resend_count", 0))
+            
             if not phone:
-                await callback_query.message.answer("لطفاً دوباره /connect را بزنید.")
-            else:
+                await callback_query.message.answer("❌ شماره تلفن پیدا نشد. لطفاً دوباره /connect را بزنید.")
+                return
+            
+            # تنظیم flag برای جلوگیری از تکرار
+            await state.update_data(resending_code=True)
+            
+            try:
                 force_sms = resend_count >= 1
                 ok = await self.telethon_manager.send_login_code(user_id, phone, force_sms=force_sms)
+                
                 if ok:
-                    await state.update_data(resend_count=resend_count + 1)
+                    await state.update_data(
+                        resend_count=resend_count + 1,
+                        resending_code=False
+                    )
                     await callback_query.message.answer("📩 کد جدید ارسال شد. لطفاً آخرین کد را وارد کنید.")
                 else:
+                    await state.update_data(resending_code=False)
                     await callback_query.message.answer("❌ ارسال مجدد کد ناموفق بود. چند دقیقه بعد دوباره تلاش کنید.")
-        
-        await callback_query.answer()
+            except Exception as e:
+                logger.error(f"Error resending code: {e}")
+                await state.update_data(resending_code=False)
+                await callback_query.message.answer("❌ خطا در ارسال مجدد کد. لطفاً بعداً تلاش کنید.")
     
     async def status_command(self, message: types.Message):
         """نمایش وضعیت کاربر"""

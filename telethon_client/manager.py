@@ -1,13 +1,7 @@
 import asyncio
 import logging
 from telethon import TelegramClient, events
-from telethon.errors import (
-    SessionPasswordNeededError, 
-    PhoneCodeInvalidError, 
-    PhoneCodeExpiredError,
-    FloodWaitError, 
-    PhoneNumberInvalidError
-)
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, FloodWaitError, PhoneNumberInvalidError
 from telethon.tl.types import User, Chat, Channel
 import os
 import re
@@ -26,245 +20,128 @@ class TelethonManager:
         self.db = DatabaseManager()
         self.clients: Dict[int, TelegramClient] = {}
         self.pending_phones: Dict[int, str] = {}
-        self.bot = None
+        self.pending_code_hash: Dict[int, str] = {}
         
+        # ایجاد دایرکتوری sessions
         os.makedirs(session_dir, exist_ok=True)
         
+        # کلمات کلیدی برای تشخیص جلسات
         self.meeting_keywords = [
             'جلسه', 'قرار', 'meeting', 'appointment', 'session',
             'میتینگ', 'ملاقات', 'دیدار', 'نشست', 'کنفرانس',
             'conference', 'call', 'تماس', 'zoom', 'skype'
         ]
         
+        # الگوهای زمانی
         self.time_patterns = [
-            r'(\d{1,2}):(\d{2})',
-            r'(\d{1,2})\.(\d{2})',
-            r'(\d{1,2})/(\d{2})',
-            r'ساعت\s*(\d{1,2})',
-            r'(\d{1,2})\s*ساعت',
+            r'(\d{1,2}):(\d{2})',  # 14:30
+            r'(\d{1,2})\.(\d{2})',  # 14.30
+            r'(\d{1,2})/(\d{2})',  # 14/30
+            r'ساعت\s*(\d{1,2})',   # ساعت 14
+            r'(\d{1,2})\s*ساعت',   # 14 ساعت
         ]
     
-    def _get_session_path(self, user_id: int) -> str:
-        """دریافت مسیر session"""
-        return os.path.join(self.session_dir, f"user_{user_id}")
-    
-    def _remove_session_files(self, user_id: int):
-        """حذف کامل فایل‌های session"""
+    async def create_client(self, user_id: int, phone_number: str) -> Optional[TelegramClient]:
+        """ایجاد کلاینت Telethon برای کاربر"""
         try:
-            session_path = self._get_session_path(user_id)
-            
-            # حذف تمام فایل‌های مرتبط
-            for ext in ['', '.session', '.session-journal']:
-                file_path = session_path + ext
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.debug(f"🗑️ Removed: {file_path}")
-            
-            logger.info(f"🧹 Session files cleaned for user {user_id}")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Error removing session files: {e}")
-    
-    async def create_client(self, user_id: int, fresh: bool = False) -> Optional[TelegramClient]:
-        """ایجاد کلاینت Telethon"""
-        try:
-            session_path = self._get_session_path(user_id)
-            
-            # اگر fresh باشه، session قدیمی رو پاک کن
-            if fresh:
-                self._remove_session_files(user_id)
-                logger.info(f"🆕 Creating fresh client for user {user_id}")
+            session_path = os.path.join(self.session_dir, f"user_{user_id}.session")
             
             client = TelegramClient(session_path, self.api_id, self.api_hash)
+            # start() would try to drive interactive login; we attach after explicit sign in
             await client.connect()
+            if not await client.is_user_authorized():
+                logger.debug("Client created but not authorized yet for user %s", user_id)
             
-            # بررسی authorization
-            if await client.is_user_authorized():
-                logger.info(f"✅ User {user_id} already authorized")
-                self.clients[user_id] = client
-                
-                # ثبت event handler
-                @client.on(events.NewMessage(incoming=True))
-                async def handle_new_message(event):
-                    await self.handle_message(event, user_id)
-                
-                return client
-            else:
-                logger.debug(f"📝 Client created but not authorized for user {user_id}")
-                self.clients[user_id] = client
-                return client
+            self.clients[user_id] = client
             
-        except Exception as e:
-            logger.error(f"❌ Error creating client: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return None
-
-    async def send_login_code(self, user_id: int, phone_number: str, force_sms: bool = False) -> bool:
-        """
-        ارسال کد ورود - با session تمیز
-        """
-        try:
-            logger.info(f"📱 Sending login code to user {user_id}")
-            logger.info(f"📞 Phone: {phone_number}, Force SMS: {force_sms}")
-            
-            # ✅ قطع و حذف client قبلی
-            if user_id in self.clients:
-                try:
-                    await self.clients[user_id].disconnect()
-                    logger.debug(f"🔌 Disconnected old client for user {user_id}")
-                except:
-                    pass
-                del self.clients[user_id]
-            
-            # ✅ حذف session files قدیمی
-            self._remove_session_files(user_id)
-            
-            # ✅ ایجاد client جدید
-            client = await self.create_client(user_id, fresh=True)
-            if not client:
-                logger.error(f"❌ Failed to create client")
-                return False
-            
-            # ذخیره شماره
-            self.pending_phones[user_id] = phone_number
-            
-            # ✅ ارسال کد
-            logger.info(f"📤 Requesting code for {phone_number}...")
-            
-            try:
-                # سعی با force_sms
-                if force_sms:
-                    sent_code = await client.send_code_request(phone_number, force_sms=True)
-                else:
-                    sent_code = await client.send_code_request(phone_number)
-                
-                logger.info(f"✅ Code sent successfully!")
-                logger.debug(f"📋 Code type: {sent_code.type}")
-                
-                return True
-                
-            except Exception as e:
-                error_str = str(e)
-                if 'PHONE_NUMBER_INVALID' in error_str:
-                    logger.error(f"❌ Invalid phone number: {phone_number}")
-                    return False
-                elif 'force_sms' in error_str.lower():
-                    # اگر مشکل force_sms داره، بدون force_sms امتحان کن
-                    logger.warning(f"⚠️ force_sms not supported, retrying...")
-                    sent_code = await client.send_code_request(phone_number)
-                    logger.info(f"✅ Code sent (without force_sms)")
-                    return True
-                else:
-                    raise
-
-        except PhoneNumberInvalidError:
-            logger.error(f"❌ Invalid phone number: {phone_number}")
-            return False
-
-        except FloodWaitError as e:
-            logger.warning(f"⏳ Flood wait: {e.seconds} seconds")
-            return False
-
-        except Exception as e:
-            logger.error(f"🔥 Error sending login code: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-
-    async def confirm_login_code(self, user_id: int, code: str = None, password: str = None) -> Dict[str, Any]:
-        """
-        تأیید کد ورود یا رمز 2FA
-        """
-        try:
-            logger.info(f"🔐 Confirming login for user {user_id}")
-            
-            # بررسی client
-            if user_id not in self.clients:
-                logger.error(f"❌ No active client for user {user_id}")
-                return {'ok': False, 'need_password': False, 'error': 'no_client'}
-            
-            client = self.clients[user_id]
-            
-            # بررسی شماره
-            phone = self.pending_phones.get(user_id)
-            if not phone:
-                logger.error(f"❌ No pending phone for user {user_id}")
-                return {'ok': False, 'need_password': False, 'error': 'no_phone'}
-            
-            # اطمینان از اتصال
-            if not client.is_connected():
-                logger.info(f"🔌 Reconnecting client...")
-                await client.connect()
-            
-            # ✅ Sign in
-            try:
-                if code is not None:
-                    # ورود با کد
-                    logger.info(f"🔑 Signing in with code: {code}")
-                    logger.debug(f"📞 Phone: {phone}")
-                    
-                    # ✅ فقط با phone و code
-                    result = await client.sign_in(phone=phone, code=code)
-                    
-                    logger.info(f"✅ Sign in successful!")
-                    
-                elif password is not None:
-                    # ورود با 2FA
-                    logger.info(f"🔐 Signing in with 2FA password")
-                    result = await client.sign_in(password=password)
-                    
-                    logger.info(f"✅ 2FA sign in successful!")
-                    
-                else:
-                    logger.error(f"❌ No code or password provided")
-                    return {'ok': False, 'need_password': False, 'error': 'missing_credentials'}
-                
-            except SessionPasswordNeededError:
-                logger.info(f"🔒 2FA password required for user {user_id}")
-                return {'ok': False, 'need_password': True, 'error': None}
-            
-            except PhoneCodeInvalidError as e:
-                logger.error(f"❌ Invalid code: {e}")
-                return {'ok': False, 'need_password': False, 'error': 'invalid_code'}
-            
-            except PhoneCodeExpiredError as e:
-                logger.error(f"⌛ Code expired: {e}")
-                return {'ok': False, 'need_password': False, 'error': 'code_expired'}
-            
-            # ✅ ورود موفق - تنظیم event handler
-            logger.info(f"🎉 User {user_id} logged in successfully!")
-            
+            # ثبت event handler برای پیام‌های جدید
             @client.on(events.NewMessage(incoming=True))
             async def handle_new_message(event):
                 await self.handle_message(event, user_id)
             
-            # به‌روزرسانی دیتابیس
-            session_file = self._get_session_path(user_id) + ".session"
-            self.db.update_telethon_status(user_id, True, session_file)
-            
-            # پاکسازی pending data
-            self.pending_phones.pop(user_id, None)
-            
-            logger.info(f"✅ User {user_id} setup complete!")
-            
-            return {'ok': True, 'need_password': False, 'error': None}
+            logger.info(f"Telethon client created for user {user_id}")
+            return client
             
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"🔥 Unexpected error: {error_msg}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            # تشخیص نوع خطا
-            if 'CODE_INVALID' in error_msg or 'PHONE_CODE_INVALID' in error_msg:
-                return {'ok': False, 'need_password': False, 'error': 'invalid_code'}
-            elif 'CODE_EXPIRED' in error_msg or 'PHONE_CODE_EXPIRED' in error_msg:
-                return {'ok': False, 'need_password': False, 'error': 'code_expired'}
-            elif 'PASSWORD' in error_msg:
-                return {'ok': False, 'need_password': True, 'error': None}
-            else:
-                return {'ok': False, 'need_password': False, 'error': error_msg}
+            logger.error(f"Error creating Telethon client for user {user_id}: {e}")
+            return None
+
+    async def send_login_code(self, user_id: int, phone_number: str, *, force_sms: bool = False) -> bool:
+        """ارسال کد ورود به شماره کاربر از طریق Telethon."""
+        try:
+            client = await self.create_client(user_id, phone_number)
+            if client is None:
+                return False
+            self.pending_phones[user_id] = phone_number
+            code = await client.send_code_request(phone_number, force_sms=force_sms)
+            # keep phone_code_hash explicitly to survive multi-worker scenarios
+            try:
+                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None) or code.phone_code_hash
+            except Exception:
+                # some Telethon versions return dict-like
+                self.pending_code_hash[user_id] = getattr(code, 'phone_code_hash', None)
+            logger.info("Login code sent to %s for user %s", phone_number, user_id)
+            return True
+        except PhoneNumberInvalidError:
+            logger.error("Invalid phone number for user %s: %s", user_id, phone_number)
+            return False
+        except FloodWaitError as e:
+            logger.error("Flood wait while sending code for user %s: %s", user_id, e)
+            return False
+        except Exception as e:
+            logger.error(f"Error sending login code for user {user_id}: {e}")
+            return False
+
+    async def confirm_login_code(self, user_id: int, code: str | None = None, password: str | None = None) -> Dict[str, Any]:
+        """تأیید کد ورود و تکمیل ورود.
+        خروجی:
+        { 'ok': bool, 'need_password': bool, 'error': Optional[str] }
+        """
+        try:
+            if user_id not in self.clients:
+                logger.error("Client not initialized for user %s", user_id)
+                return { 'ok': False, 'need_password': False, 'error': 'client_not_initialized' }
+            client = self.clients[user_id]
+            phone = self.pending_phones.get(user_id)
+            if not phone:
+                logger.error("No pending phone number for user %s", user_id)
+                return { 'ok': False, 'need_password': False, 'error': 'no_pending_phone' }
+
+            try:
+                if code is not None:
+                    pch = self.pending_code_hash.get(user_id)
+                    await client.sign_in(phone=phone, code=code, phone_code_hash=pch)
+                elif password is not None:
+                    # If only password provided (after SessionPasswordNeeded), try password sign-in
+                    await client.sign_in(password=password)
+                else:
+                    return { 'ok': False, 'need_password': False, 'error': 'missing_code_or_password' }
+            except SessionPasswordNeededError:
+                # Password needed; caller should ask for it
+                logger.info("2FA password required for user %s", user_id)
+                return { 'ok': False, 'need_password': True, 'error': None }
+
+            # Mark connected and add handlers
+            @client.on(events.NewMessage(incoming=True))
+            async def handle_new_message(event):
+                await self.handle_message(event, user_id)
+
+            self.db.update_telethon_status(user_id, True, os.path.join(self.session_dir, f"user_{user_id}.session"))
+            logger.info("User %s authorized successfully", user_id)
+            # Cleanup pending phone
+            self.pending_phones.pop(user_id, None)
+            self.pending_code_hash.pop(user_id, None)
+            return { 'ok': True, 'need_password': False, 'error': None }
+        except PhoneCodeInvalidError:
+            logger.error("Invalid login code for user %s", user_id)
+            return { 'ok': False, 'need_password': False, 'error': 'invalid_code' }
+        except Exception as e:
+            msg = str(e)
+            if 'expired' in msg.lower():
+                # Hint caller to resend
+                return { 'ok': False, 'need_password': False, 'error': 'code_expired' }
+            logger.error(f"Error confirming login code for user {user_id}: {e}")
+            return { 'ok': False, 'need_password': False, 'error': str(e) }
     
     async def handle_message(self, event, user_id: int):
         """پردازش پیام‌های دریافتی"""
@@ -272,21 +149,22 @@ class TelethonManager:
             message = event.message
             chat = await event.get_chat()
             
+            # فقط پیام‌های متنی را پردازش می‌کنیم
             if not message.text:
                 return
             
             message_text = message.text.lower()
             
-            # تشخیص کلمات کلیدی
+            # بررسی وجود کلمات کلیدی
             detected_keywords = []
             for keyword in self.meeting_keywords:
                 if keyword.lower() in message_text:
                     detected_keywords.append(keyword)
             
             if detected_keywords:
-                logger.info(f"🔍 Meeting detected: {detected_keywords}")
+                logger.info(f"Meeting keywords detected for user {user_id}: {detected_keywords}")
                 
-                # ذخیره در DB
+                # ذخیره پیام شناسایی شده در دیتابیس
                 message_id = self.db.add_detected_message(
                     user_id=user_id,
                     chat_id=chat.id,
@@ -294,21 +172,60 @@ class TelethonManager:
                     detected_keywords=", ".join(detected_keywords)
                 )
                 
-                # ارسال به ربات
-                if self.bot:
-                    await self.bot.send_meeting_detection_message(
-                        user_id, 
-                        message.text, 
-                        chat.id
-                    )
-                else:
-                    logger.warning(f"⚠️ Bot not connected")
+                # ارسال پیام تشخیص به کاربر از طریق ربات
+                await self.send_detection_notification(user_id, message.text, chat.id, message_id)
                 
         except Exception as e:
-            logger.error(f"❌ Error handling message: {e}")
+            logger.error(f"Error handling message for user {user_id}: {e}")
+    
+    async def send_detection_notification(self, user_id: int, message_text: str, chat_id: int, message_id: int):
+        """ارسال اطلاعیه تشخیص جلسه"""
+        try:
+            # اینجا باید با ربات تلگرام ارتباط برقرار کنیم
+            # فعلاً فقط در لاگ ثبت می‌کنیم
+            logger.info(f"Sending detection notification to user {user_id}")
+            
+            # TODO: ارسال پیام از طریق ربات تلگرام
+            # bot.send_meeting_detection_message(user_id, message_text, chat_id)
+            
+        except Exception as e:
+            logger.error(f"Error sending detection notification: {e}")
+    
+    async def extract_time_from_message(self, message_text: str) -> Optional[Dict[str, Any]]:
+        """استخراج زمان از پیام"""
+        try:
+            for pattern in self.time_patterns:
+                match = re.search(pattern, message_text)
+                if match:
+                    if ':' in pattern or '.' in pattern or '/' in pattern:
+                        hour = int(match.group(1))
+                        minute = int(match.group(2))
+                    else:
+                        hour = int(match.group(1))
+                        minute = 0
+                    
+                    # ایجاد زمان برای امروز
+                    now = datetime.now()
+                    event_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                    
+                    # اگر زمان گذشته است، برای فردا تنظیم کن
+                    if event_time <= now:
+                        event_time += timedelta(days=1)
+                    
+                    return {
+                        'start_time': event_time,
+                        'end_time': event_time + timedelta(hours=1),  # پیش‌فرض 1 ساعت
+                        'extracted_time': f"{hour}:{minute:02d}"
+                    }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting time from message: {e}")
+            return None
     
     async def get_user_info(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """دریافت اطلاعات کاربر"""
+        """دریافت اطلاعات کاربر از Telethon"""
         try:
             if user_id not in self.clients:
                 return None
@@ -321,11 +238,12 @@ class TelethonManager:
                 'username': me.username,
                 'first_name': me.first_name,
                 'last_name': me.last_name,
-                'phone': me.phone
+                'phone': me.phone,
+                'is_bot': me.bot
             }
             
         except Exception as e:
-            logger.error(f"❌ Error getting user info: {e}")
+            logger.error(f"Error getting user info for {user_id}: {e}")
             return None
     
     async def get_chat_info(self, user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
@@ -355,8 +273,24 @@ class TelethonManager:
             return None
             
         except Exception as e:
-            logger.error(f"❌ Error getting chat info: {e}")
+            logger.error(f"Error getting chat info for {user_id}, {chat_id}: {e}")
             return None
+    
+    async def send_message(self, user_id: int, chat_id: int, text: str) -> bool:
+        """ارسال پیام از طریق Telethon"""
+        try:
+            if user_id not in self.clients:
+                return False
+            
+            client = self.clients[user_id]
+            await client.send_message(chat_id, text)
+            
+            logger.info(f"Message sent to {chat_id} for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending message for user {user_id}: {e}")
+            return False
     
     async def disconnect_user(self, user_id: int) -> bool:
         """قطع اتصال کاربر"""
@@ -365,64 +299,88 @@ class TelethonManager:
                 await self.clients[user_id].disconnect()
                 del self.clients[user_id]
                 
+                # به‌روزرسانی وضعیت در دیتابیس
                 self.db.update_telethon_status(user_id, False)
-                logger.info(f"✅ User {user_id} disconnected")
+                
+                logger.info(f"User {user_id} disconnected from Telethon")
                 return True
             
             return False
             
         except Exception as e:
-            logger.error(f"❌ Error disconnecting: {e}")
+            logger.error(f"Error disconnecting user {user_id}: {e}")
             return False
+    
+    async def get_all_connected_users(self) -> List[int]:
+        """دریافت لیست تمام کاربران متصل"""
+        return list(self.clients.keys())
     
     async def is_user_connected(self, user_id: int) -> bool:
         """بررسی اتصال کاربر"""
-        if user_id not in self.clients:
-            return False
-        
-        try:
-            client = self.clients[user_id]
-            return client.is_connected() and await client.is_user_authorized()
-        except:
-            return False
+        return user_id in self.clients and self.clients[user_id].is_connected()
     
     async def start_monitoring(self, user_id: int, phone_number: str) -> bool:
-        """شروع مانیتورینگ"""
+        """شروع مانیتورینگ برای کاربر"""
         try:
-            # بررسی session موجود
-            session_file = self._get_session_path(user_id) + ".session"
+            if user_id in self.clients:
+                logger.info(f"User {user_id} is already connected")
+                return True
             
-            if os.path.exists(session_file):
-                logger.info(f"📂 Found existing session for user {user_id}")
-                client = await self.create_client(user_id, fresh=False)
-                
-                if client and await client.is_user_authorized():
-                    logger.info(f"✅ User {user_id} reconnected from session")
-                    return True
-                else:
-                    logger.info(f"⚠️ Session exists but not authorized")
+            client = await self.create_client(user_id, phone_number)
+            if client:
+                logger.info(f"Started monitoring for user {user_id}")
+                return True
             
-            logger.info(f"🆕 Need fresh login for user {user_id}")
             return False
             
         except Exception as e:
-            logger.error(f"❌ Error starting monitoring: {e}")
+            logger.error(f"Error starting monitoring for user {user_id}: {e}")
             return False
     
+    async def stop_monitoring(self, user_id: int) -> bool:
+        """توقف مانیتورینگ برای کاربر"""
+        return await self.disconnect_user(user_id)
+    
     async def cleanup(self):
-        """پاکسازی تمام اتصالات"""
+        """پاکسازی و بستن تمام اتصالات"""
         try:
-            logger.info(f"🧹 Cleaning up {len(self.clients)} clients...")
-            
-            for user_id, client in list(self.clients.items()):
-                try:
-                    await client.disconnect()
-                    logger.debug(f"✅ Disconnected client {user_id}")
-                except Exception as e:
-                    logger.warning(f"⚠️ Error disconnecting {user_id}: {e}")
+            for user_id, client in self.clients.items():
+                await client.disconnect()
             
             self.clients.clear()
-            logger.info("✅ Cleanup complete")
+            logger.info("All Telethon connections cleaned up")
             
         except Exception as e:
-            logger.error(f"❌ Error during cleanup: {e}")
+            logger.error(f"Error during cleanup: {e}")
+
+# تابع اصلی برای تست
+async def main():
+    """تابع اصلی برای تست Telethon"""
+    import os
+    from dotenv import load_dotenv
+    
+    load_dotenv('config.env')
+    
+    api_id = int(os.getenv("TELEGRAM_API_ID"))
+    api_hash = os.getenv("TELEGRAM_API_HASH")
+    
+    if not api_id or not api_hash:
+        logger.error("Missing API credentials!")
+        return
+    
+    manager = TelethonManager(api_id, api_hash)
+    
+    try:
+        # تست اتصال
+        print("Telethon Manager initialized successfully!")
+        
+        # نگه داشتن برنامه در حال اجرا
+        await asyncio.sleep(3600)  # 1 ساعت
+        
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        await manager.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())
