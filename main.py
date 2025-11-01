@@ -17,15 +17,15 @@ from typing import Optional
 # اضافه کردن مسیر پروژه به sys.path
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, 'calendar'))
 
 from dotenv import load_dotenv
 from bot.main import TelegramBot
 from telethon_client.manager import TelethonManager
-from calendar_api import GoogleCalendarManager
+from calendar.calendar_api import GoogleCalendarManager  # ✅ اصلاح شد
 from database.db import DatabaseManager
 
 # تنظیمات لاگینگ
+os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -48,6 +48,7 @@ class MeetingAssistant:
         
         # بارگذاری متغیرهای محیطی
         load_dotenv('config.env')
+        load_dotenv('.env')  # ✅ اضافه شد برای پشتیبانی از .env
         
         # تنظیمات
         self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -65,44 +66,56 @@ class MeetingAssistant:
             ("TELEGRAM_BOT_TOKEN", self.bot_token),
             ("TELEGRAM_API_ID", self.api_id),
             ("TELEGRAM_API_HASH", self.api_hash),
-            ("GOOGLE_SERVICE_ACCOUNT_FILE", self.service_account_file),
-            ("GOOGLE_CALENDAR_ID", self.calendar_id)
         ]
         
         missing_vars = []
         for var_name, var_value in required_vars:
-            if not var_value:
+            if not var_value or (var_name == "TELEGRAM_API_ID" and var_value == 0):
                 missing_vars.append(var_name)
         
         if missing_vars:
-            logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
-            logger.error("Please check your .env file or environment variables")
+            logger.error(f"❌ Missing required environment variables: {', '.join(missing_vars)}")
+            logger.error("Please check your .env file or config.env file")
             sys.exit(1)
         
-        logger.info("Configuration validation successful")
+        # ✅ Google Calendar اختیاری است
+        if not self.service_account_file or not self.calendar_id:
+            logger.warning("⚠️ Google Calendar credentials not found. Calendar features will be disabled.")
+        
+        logger.info("✅ Configuration validation successful")
     
     async def initialize(self):
         """راه‌اندازی اولیه تمام سرویس‌ها"""
         try:
-            logger.info("Initializing Meeting Assistant...")
+            logger.info("🚀 Initializing Meeting Assistant...")
             
-            # ایجاد دایرکتوری logs
+            # ایجاد دایرکتوری‌های مورد نیاز
             os.makedirs("logs", exist_ok=True)
+            os.makedirs("telethon_client/sessions", exist_ok=True)
+            os.makedirs("database", exist_ok=True)
             
             # راه‌اندازی دیتابیس
             self.db = DatabaseManager()
             logger.info("✅ Database initialized")
             
-            # راه‌اندازی Google Calendar
-            self.calendar_manager = GoogleCalendarManager(
-                self.service_account_file, 
-                self.calendar_id
-            )
-            
-            if self.calendar_manager.test_connection():
-                logger.info("✅ Google Calendar connected")
+            # راه‌اندازی Google Calendar (اختیاری)
+            if self.service_account_file and self.calendar_id:
+                try:
+                    self.calendar_manager = GoogleCalendarManager(
+                        self.service_account_file, 
+                        self.calendar_id
+                    )
+                    
+                    if self.calendar_manager.test_connection():
+                        logger.info("✅ Google Calendar connected")
+                    else:
+                        logger.warning("⚠️ Google Calendar connection failed")
+                        self.calendar_manager = None
+                except Exception as e:
+                    logger.warning(f"⚠️ Google Calendar initialization failed: {e}")
+                    self.calendar_manager = None
             else:
-                logger.warning("⚠️ Google Calendar connection failed")
+                logger.info("⏭️ Google Calendar skipped (credentials not provided)")
             
             # راه‌اندازی Telethon Manager
             self.telethon_manager = TelethonManager(
@@ -117,25 +130,21 @@ class MeetingAssistant:
                 self.api_id, 
                 self.api_hash
             )
+            
+            # ✅ اتصال سرویس‌ها به ربات
+            self.bot.telethon_manager = self.telethon_manager
+            self.bot.calendar_manager = self.calendar_manager
+            self.bot.db = self.db
+            
+            # ✅ اتصال ربات به Telethon برای نوتیفیکیشن‌ها
+            self.telethon_manager.bot = self.bot
+            
             logger.info("✅ Telegram Bot initialized")
-            
-            # اتصال ربات به Telethon Manager
-            self._connect_bot_to_telethon()
-            
             logger.info("🎉 Meeting Assistant initialized successfully!")
             
         except Exception as e:
-            logger.error(f"Error initializing Meeting Assistant: {e}")
+            logger.error(f"❌ Error initializing Meeting Assistant: {e}")
             raise
-    
-    def _connect_bot_to_telethon(self):
-        """اتصال ربات به Telethon Manager"""
-        if self.bot and self.telethon_manager:
-            # اضافه کردن متدهای Telethon به ربات
-            self.bot.telethon_manager = self.telethon_manager
-            self.bot.calendar_manager = self.calendar_manager
-            
-            logger.info("Bot connected to Telethon Manager")
     
     async def start_telethon_for_user(self, user_id: int, phone_number: str) -> bool:
         """شروع مانیتورینگ Telethon برای کاربر"""
@@ -149,14 +158,14 @@ class MeetingAssistant:
             if success:
                 # به‌روزرسانی وضعیت در دیتابیس
                 self.db.update_telethon_status(user_id, True, f"user_{user_id}.session")
-                logger.info(f"Telethon monitoring started for user {user_id}")
+                logger.info(f"✅ Telethon monitoring started for user {user_id}")
             else:
-                logger.error(f"Failed to start Telethon monitoring for user {user_id}")
+                logger.error(f"❌ Failed to start Telethon monitoring for user {user_id}")
             
             return success
             
         except Exception as e:
-            logger.error(f"Error starting Telethon for user {user_id}: {e}")
+            logger.error(f"❌ Error starting Telethon for user {user_id}: {e}")
             return False
     
     async def create_meeting_from_detection(self, user_id: int, message_text: str, 
@@ -164,7 +173,7 @@ class MeetingAssistant:
         """ایجاد جلسه از تشخیص پیام"""
         try:
             if not self.calendar_manager:
-                logger.error("Calendar Manager not initialized")
+                logger.warning("Calendar Manager not initialized - skipping meeting creation")
                 return None
             
             # دریافت اطلاعات کاربر
@@ -192,29 +201,15 @@ class MeetingAssistant:
                     calendar_link=event['html_link']
                 )
                 
-                logger.info(f"Meeting created for user {user_id}: {event['html_link']}")
+                logger.info(f"✅ Meeting created for user {user_id}: {event['html_link']}")
                 return event
             else:
-                logger.error(f"Failed to create meeting for user {user_id}")
+                logger.error(f"❌ Failed to create meeting for user {user_id}")
                 return None
                 
         except Exception as e:
-            logger.error(f"Error creating meeting for user {user_id}: {e}")
+            logger.error(f"❌ Error creating meeting for user {user_id}: {e}")
             return None
-    
-    async def send_meeting_confirmation(self, user_id: int, message_text: str, 
-                                      chat_id: int, message_id: int):
-        """ارسال تایید جلسه به کاربر"""
-        try:
-            if not self.bot:
-                logger.error("Bot not initialized")
-                return
-            
-            await self.bot.send_meeting_detection_message(user_id, message_text, chat_id)
-            logger.info(f"Meeting confirmation sent to user {user_id}")
-            
-        except Exception as e:
-            logger.error(f"Error sending meeting confirmation to user {user_id}: {e}")
     
     async def run(self):
         """اجرای اصلی برنامه"""
@@ -222,25 +217,25 @@ class MeetingAssistant:
             await self.initialize()
             
             logger.info("🚀 Starting Meeting Assistant...")
+            logger.info("📱 Bot is ready to receive messages")
             logger.info("Press Ctrl+C to stop")
             
-            # اجرای ربات در پس‌زمینه
-            bot_task = asyncio.create_task(self.bot.start_polling())
-            
-            # نگه داشتن برنامه در حال اجرا
-            await bot_task
+            # اجرای ربات
+            await self.bot.start_polling()
             
         except KeyboardInterrupt:
             logger.info("🛑 Shutting down Meeting Assistant...")
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.error(f"❌ Unexpected error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
         finally:
             await self.cleanup()
     
     async def cleanup(self):
         """پاکسازی منابع"""
         try:
-            logger.info("Cleaning up resources...")
+            logger.info("🧹 Cleaning up resources...")
             
             if self.telethon_manager:
                 await self.telethon_manager.cleanup()
@@ -249,19 +244,20 @@ class MeetingAssistant:
             logger.info("✅ Cleanup completed")
             
         except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            logger.error(f"❌ Error during cleanup: {e}")
 
 def main():
     """تابع اصلی"""
     print("""
-    Smart Meeting Assistant
-    
-    This program combines:
-    • Telegram Bot for user interaction
-    • Telethon for message monitoring
-    • Google Calendar API for meeting scheduling
-    
-    To start, configure config.env file and run the program.
+    ╔════════════════════════════════════════╗
+    ║   🤖 Smart Meeting Assistant 🤖       ║
+    ╠════════════════════════════════════════╣
+    ║  Telegram Bot + Telethon + Calendar   ║
+    ║                                        ║
+    ║  This program monitors your Telegram  ║
+    ║  messages and automatically schedules ║
+    ║  meetings in Google Calendar.         ║
+    ╚════════════════════════════════════════╝
     """)
     
     # ایجاد و اجرای دستیار
@@ -273,6 +269,8 @@ def main():
         print("\n👋 برنامه متوقف شد.")
     except Exception as e:
         print(f"❌ خطا در اجرای برنامه: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
